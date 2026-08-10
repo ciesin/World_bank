@@ -1,5 +1,5 @@
-# World_bank
-Materials, guides, and codes supporting the 2026 World Bank report.
+# Parcels
+Materials, guides, and codes supporting the creation of parcels
 
 
 1. Create_sam3_parcel_tiles.py
