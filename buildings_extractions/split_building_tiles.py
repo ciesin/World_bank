@@ -9,15 +9,18 @@ def split_building_tiles(folder,img,size):
     target_folder = (rf"{folder}/{img_name}_{size}")
     print(target_folder)
 
-    if not arcpy.Exists(target_folder):
+    # Extract parent directory and folder name
+    parent_dir = os.path.dirname(target_folder)
+    folder_name = os.path.basename(target_folder)
 
-        parent_dir = os.path.dirname(target_folder)
-        folder_name = os.path.basename(target_folder)
+    # Check if the folder exists and delete it
+    if arcpy.Exists(target_folder):
+        arcpy.management.Delete(target_folder)
+        print(f"Deleted existing folder: {target_folder}")
 
-        arcpy.management.CreateFolder(parent_dir, folder_name)
-        print(f"Folder created: {target_folder}")
-    else:
-        print("Folder already exists.")
+    # Create the folder
+    arcpy.management.CreateFolder(parent_dir, folder_name)
+    print(f"Folder created: {target_folder}")
 
     arcpy.management.SplitRaster(
         in_raster=img,
