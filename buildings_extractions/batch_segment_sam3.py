@@ -12,7 +12,7 @@ start_wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 start_perf = time.perf_counter()
 print(f"Script started at: {start_wall}")
 
-prompt = 'land parcel'
+prompt = 'building'
 
 n = f"juba_parcels_sam_all_tiles512"
 
