@@ -1,4 +1,4 @@
-# Parcels
+# Buildings
 Materials, guides, and codes supporting the extraction of buildings
 
 1. split_building_tiles.py
