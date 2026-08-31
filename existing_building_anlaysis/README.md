@@ -1,4 +1,4 @@
-# Juba building-coverage pilot
+# Building-coverage pilot
 
 This workspace contains a one-city comparison of six building products over the
 SPARC Juba AOI (345.887 km²):
@@ -10,6 +10,8 @@ SPARC Juba AOI (345.887 km²):
 - GlobalBuildingAtlas GBA.Height, 2025 mediaTUM release (3 m modeled height)
 - 3D-GloBFP, 2020 footprints
 - DLR WSF 3D v2 Building Fraction
+
+The analysis was repeated for 93 cities in Africa. The scripts with 'juba' in the name are the initial prototype scripts, the other scripts are the final analysis run on the complete data set. 
 
 ## Primary outputs
 
