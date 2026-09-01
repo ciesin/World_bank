@@ -31,7 +31,7 @@ def split_building_tiles(folder,img,size):
         resampling_type="NEAREST",
         num_rasters="1 1",
         tile_size=f"{size} {size}",
-        overlap=0,
+        overlap=256,
         units="PIXELS",
         cell_size=None,
         origin=None,
