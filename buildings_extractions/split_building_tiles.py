@@ -2,7 +2,7 @@ import arcpy
 import os
 from pathlib import Path
 
-def split_building_tiles(folder,img,size):
+def split_building_tiles(folder,img,size,overlap):
 
     # Create folder 
     img_name = Path(img).stem
@@ -31,7 +31,7 @@ def split_building_tiles(folder,img,size):
         resampling_type="NEAREST",
         num_rasters="1 1",
         tile_size=f"{size} {size}",
-        overlap=256,
+        overlap=overlap,
         units="PIXELS",
         cell_size=None,
         origin=None,
@@ -46,6 +46,6 @@ def split_building_tiles(folder,img,size):
 #folder = folder path for exporting - subfolder will be created
 #img = path for raster image
 
-split_building_tiles(folder,img,256)
-split_building_tiles(folder,img,512)
-split_building_tiles(folder,img,1024)
+split_building_tiles(folder,img,256,128)
+split_building_tiles(folder,img,512,256)
+split_building_tiles(folder,img,1024,512)
