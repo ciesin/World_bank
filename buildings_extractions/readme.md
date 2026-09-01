@@ -16,3 +16,5 @@ HF_TOKEN = "hf_your_actual_token_here"
 # Authenticate session
 login(token=HF_TOKEN, add_to_git_credential=False)
 ```
+
+3. Run sam3_edge_mosaic.ipynb using the folder of output classified sam3 tiles. This script will merge tiles while dealing with overlaps and removing edge pixels.
