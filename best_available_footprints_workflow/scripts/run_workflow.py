@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, download, and build best-available footprints for one city."""
+"""Prepare, download, build, and height-enrich best-available footprints."""
 
 from __future__ import annotations
 
@@ -40,6 +40,19 @@ def main() -> None:
     parser.add_argument("--overture-cli")
     parser.add_argument("--skip-overture", action="store_true")
     parser.add_argument("--skip-3d-globfp", action="store_true")
+    parser.add_argument(
+        "--skip-raster-heights", action="store_true",
+        help="Do not acquire or attach Google 2.5D, TEMPO, or GBA.Height",
+    )
+    parser.add_argument("--skip-google-height", action="store_true")
+    parser.add_argument("--skip-tempo-height", action="store_true")
+    parser.add_argument("--skip-gba-height", action="store_true")
+    parser.add_argument(
+        "--download-tempo", action="store_true",
+        help="Download TEMPO COGs; default is cloud streaming",
+    )
+    parser.add_argument("--google-presence-threshold", type=float, default=0.5)
+    parser.add_argument("--tempo-density-threshold", type=float, default=0.001)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     slug = args.city_slug or slugify(args.city_name)
@@ -77,6 +90,26 @@ def main() -> None:
     if args.force:
         command.append("--force")
     run(command)
+
+    if not args.skip_raster_heights:
+        command = [
+            sys.executable, str(SCRIPTS / "acquire_height_sources.py"), "--city", slug,
+        ]
+        for enabled, flag in [
+            (args.skip_google_height, "--skip-google"),
+            (args.skip_tempo_height, "--skip-tempo"),
+            (args.skip_gba_height, "--skip-gba"),
+            (args.download_tempo, "--download-tempo"),
+            (args.force, "--force"),
+        ]:
+            if enabled:
+                command.append(flag)
+        run(command)
+        run([
+            sys.executable, str(SCRIPTS / "enrich_raster_heights.py"), "--city", slug,
+            "--google-presence-threshold", str(args.google_presence_threshold),
+            "--tempo-density-threshold", str(args.tempo_density_threshold),
+        ])
     print(f"Finished: {WORKFLOW / 'outputs' / slug}")
 
 

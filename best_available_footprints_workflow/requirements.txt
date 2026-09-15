@@ -1,4 +1,5 @@
 geopandas
+fsspec
 matplotlib
 numpy
 overturemaps
@@ -6,5 +7,7 @@ pandas
 pyarrow
 pyogrio
 pyproj
+rasterio
 requests
+s2sphere
 shapely
