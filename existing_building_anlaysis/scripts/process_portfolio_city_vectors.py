@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run reduced vector analysis and best-available selection for one portfolio city."""
+"""Run vector analysis and best-available selection for one portfolio city."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ import shapely
 from matplotlib import pyplot as plt
 from rasterio.features import rasterize
 
+from footprint_overlap_resolution import resolve_overlaps_by_recency
+
 
 matplotlib.use("Agg")
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,9 +26,17 @@ CITIES = ROOT / "data/cities"
 OUTPUTS = ROOT / "outputs/cities"
 MIN_AREA_M2 = 4.0
 MIN_INTERSECTION_M2 = 1.0
+OVERLAP_RESOLUTION_MIN_M2 = 0.01
+OVERLAP_RESOLUTION_SMALLER_FRACTION = 0.20
 DUPLICATE_COVERAGE = 0.35
 NEAR_DISTANCE_M = 4.0
 MATCH_CHUNK = 100_000
+GLOBFP_FOOTPRINT_DATE = pd.Timestamp("2020-01-01", tz="UTC")
+RECENCY_TIEBREAK = {
+    "OpenStreetMap": 3,
+    "Overture_nonOSM": 2,
+    "3D-GloBFP_gapfill": 1,
+}
 
 
 def clean(data: gpd.GeoDataFrame, crs) -> gpd.GeoDataFrame:
@@ -51,6 +61,15 @@ def source_value(value, key, default=None):
     return value[0].get(key, default)
 
 
+def latest_source_update_time(value):
+    if value is None or len(value) == 0:
+        return pd.NaT
+    times = pd.to_datetime(
+        [item.get("update_time") for item in value], errors="coerce", utc=True
+    )
+    return times.max() if times.notna().any() else pd.NaT
+
+
 def load_sources(city_slug: str, crs, aoi, bounds_wgs84):
     source_dir = CITIES / city_slug / "sources"
     columns = [
@@ -63,6 +82,7 @@ def load_sources(city_slug: str, crs, aoi, bounds_wgs84):
     overture["source_dataset"] = [source_value(v, "dataset", "unknown") for v in overture.sources]
     overture["source_record_id"] = [source_value(v, "record_id") for v in overture.sources]
     overture["source_update_time"] = [source_value(v, "update_time") for v in overture.sources]
+    overture["footprint_update_time"] = [latest_source_update_time(v) for v in overture.sources]
     overture["source_version"] = [source_value(v, "version") for v in overture.sources]
     overture["source_license"] = [source_value(v, "license") for v in overture.sources]
     overture["native_height_m"] = pd.to_numeric(overture.height, errors="coerce")
@@ -212,6 +232,7 @@ def selected_overture(data, city_slug) -> gpd.GeoDataFrame:
         "geometry_license": data.source_license.astype(str).to_numpy(),
         "source_record_id": data.source_record_id.to_numpy(),
         "source_update_time": data.source_update_time.to_numpy(),
+        "footprint_update_time": data.footprint_update_time.to_numpy(),
         "source_version": data.source_version.to_numpy(),
         "native_height_m": data.native_height_m.to_numpy(),
         "native_floors": data.native_floors.to_numpy(),
@@ -219,6 +240,13 @@ def selected_overture(data, city_slug) -> gpd.GeoDataFrame:
         "geometry": data.geometry.to_numpy(),
     }, geometry="geometry", crs=data.crs)
     frame["integrated_id"] = [f"{city_slug}-OVR-{i:08d}" for i in range(1, len(frame) + 1)]
+    frame["footprint_date"] = pd.to_datetime(
+        frame.footprint_update_time, errors="coerce", utc=True
+    )
+    frame["footprint_date_basis"] = np.where(
+        frame.footprint_date.notna(), "source_update_time", "unknown"
+    )
+    frame["recency_tiebreak_priority"] = frame.geometry_source.map(RECENCY_TIEBREAK)
     return frame
 
 
@@ -236,6 +264,9 @@ def selected_globfp(data, city_slug) -> gpd.GeoDataFrame:
         "geometry": data.geometry.to_numpy(),
     }, geometry="geometry", crs=data.crs)
     frame["integrated_id"] = [f"{city_slug}-GLO-{i:08d}" for i in range(1, len(frame) + 1)]
+    frame["footprint_date"] = GLOBFP_FOOTPRINT_DATE
+    frame["footprint_date_basis"] = "dataset_vintage_2020"
+    frame["recency_tiebreak_priority"] = frame.geometry_source.map(RECENCY_TIEBREAK)
     return frame
 
 
@@ -380,16 +411,25 @@ def process(city_slug: str, force: bool = False):
     overture, globfp = load_sources(city_slug, crs, aoi, metadata["bbox_wgs84"])
     print(f"{city_slug}: Overture {len(overture):,}; 3D-GloBFP {len(globfp):,}", flush=True)
     selected_ov = selected_overture(overture, city_slug)
+    selected_gl = selected_globfp(globfp, city_slug)
+    provisional = gpd.GeoDataFrame(
+        pd.concat([selected_ov, selected_gl], ignore_index=True),
+        geometry="geometry", crs=crs,
+    )
+    integrated, overlap_suppressed = resolve_overlaps_by_recency(
+        provisional, min_intersection_m2=OVERLAP_RESOLUTION_MIN_M2,
+        min_smaller_overlap=OVERLAP_RESOLUTION_SMALLER_FRACTION,
+        query_chunk=MATCH_CHUNK,
+    )
+
+    # Preserve the cross-source match diagnostics as evidence/support fields;
+    # these no longer decide which geometry wins.
     matches = add_near_matches(globfp, selected_ov, overlap_matches(globfp, selected_ov))
     duplicate = matches.relation.isin(["overlap_duplicate", "near_duplicate"])
-    suppressed = set(matches.loc[duplicate, "candidate_index"].astype(int))
-    keep = np.array([i not in suppressed for i in range(len(globfp))])
-    selected_gl = selected_globfp(globfp.loc[keep].reset_index(drop=True), city_slug)
-    integrated = gpd.GeoDataFrame(pd.concat([selected_ov, selected_gl], ignore_index=True),
-                                  geometry="geometry", crs=crs)
     integrated["globfp_support"] = False
     supported = matches.loc[duplicate, "preferred_index"].dropna().astype(int).unique()
-    integrated.loc[supported, "globfp_support"] = True
+    supported_ids = set(selected_ov.integrated_id.to_numpy()[supported])
+    integrated.loc[integrated.integrated_id.isin(supported_ids), "globfp_support"] = True
     integrated["osm_version"] = pd.to_numeric(
         integrated.source_record_id.astype("string").str.extract(r"@(\d+)$")[0], errors="coerce"
     ).astype("Int32")
@@ -411,8 +451,8 @@ def process(city_slug: str, force: bool = False):
         integrated.geometry_source.eq("OpenStreetMap"),
         integrated.geometry_source.eq("Overture_nonOSM") & integrated.globfp_support,
         integrated.geometry_source.eq("Overture_nonOSM"),
-    ], ["OSM_preferred_supported", "OSM_preferred_multiple_versions", "OSM_preferred_single_version",
-        "Overture_gapfill_3D_supported", "Overture_gapfill"], default="3D-GloBFP_gapfill")
+    ], ["OSM_selected_supported", "OSM_selected_multiple_versions", "OSM_selected_single_version",
+        "Overture_selected_3D_supported", "Overture_selected"], default="3D-GloBFP_selected")
     integrated["review_required"] = integrated.geometry_confidence.eq("low")
 
     int_seg = assign_segments(integrated, segments)
@@ -426,15 +466,35 @@ def process(city_slug: str, force: bool = False):
     lineage = pd.DataFrame({
         "integrated_id": integrated.integrated_id, "role": "selected_geometry",
         "source_dataset": integrated.geometry_dataset, "source_id": integrated.geometry_source_id,
+        "footprint_date": integrated.footprint_date,
+        "footprint_date_basis": integrated.footprint_date_basis,
+        "retained_footprint_date": integrated.footprint_date,
         "relation": "selected", "candidate_coverage": 1.0, "iou": 1.0,
     })
-    suppressed_rows = matches.loc[duplicate].copy()
+    suppressed_rows = overlap_suppressed.copy()
     if len(suppressed_rows):
-        suppressed_rows["integrated_id"] = selected_ov.integrated_id.to_numpy()[suppressed_rows.preferred_index.astype(int)]
-        suppressed_rows["role"] = "supporting_or_suppressed_duplicate"
-        suppressed_rows["source_dataset"] = "3D-GloBFP / GBA-correlated family"
-        suppressed_rows["source_id"] = globfp.globfp_id.to_numpy()[suppressed_rows.candidate_index.astype(int)]
-    cols = ["integrated_id", "role", "source_dataset", "source_id", "relation",
+        suppressed_rows["integrated_id"] = suppressed_rows.retained_integrated_id
+        suppressed_rows["role"] = "suppressed_older_overlap"
+        suppressed_rows["source_dataset"] = provisional.geometry_dataset.to_numpy()[
+            suppressed_rows.suppressed_index.astype(int)
+        ]
+        suppressed_rows["source_id"] = provisional.geometry_source_id.to_numpy()[
+            suppressed_rows.suppressed_index.astype(int)
+        ]
+        suppressed_rows["footprint_date"] = provisional.footprint_date.to_numpy()[
+            suppressed_rows.suppressed_index.astype(int)
+        ]
+        suppressed_rows["footprint_date_basis"] = provisional.footprint_date_basis.to_numpy()[
+            suppressed_rows.suppressed_index.astype(int)
+        ]
+        suppressed_rows["retained_footprint_date"] = provisional.footprint_date.to_numpy()[
+            suppressed_rows.retained_index.astype(int)
+        ]
+        suppressed_rows["candidate_coverage"] = suppressed_rows.suppressed_coverage
+        suppressed_rows["iou"] = np.nan
+        suppressed_rows["match_structure"] = "smaller_overlap_20pct_recency_winner"
+    cols = ["integrated_id", "role", "source_dataset", "source_id",
+            "footprint_date", "footprint_date_basis", "retained_footprint_date", "relation",
             "candidate_coverage", "iou", "match_structure"]
     lineage = pd.concat([lineage.reindex(columns=cols), suppressed_rows.reindex(columns=cols)], ignore_index=True)
 
@@ -450,13 +510,15 @@ def process(city_slug: str, force: bool = False):
         "input_overture": int(len(overture)), "input_globfp3d": int(len(globfp)),
         "integrated_buildings": int(len(integrated)),
         "geometry_source_counts": {str(k): int(v) for k,v in integrated.geometry_source.value_counts().items()},
-        "suppressed_globfp_duplicates": int(len(suppressed)),
+        "suppressed_by_recency_overlap": int(len(overlap_suppressed)),
         "geometry_confidence_counts": {str(k): int(v) for k,v in integrated.geometry_confidence.value_counts().items()},
         "vector_height_available": int(integrated.height_best_m.notna().sum()),
         "vector_height_available_pct": float(100 * integrated.height_best_m.notna().mean()) if len(integrated) else 0,
         "invalid_geometries": int((~integrated.geometry.is_valid).sum()),
         "unassigned_segments": int(integrated.ANALYSIS_ID.isna().sum()),
-        "method": "Reduced portfolio vector workflow: OSM > other Overture > nonduplicating 3D-GloBFP/GBA-family geometry.",
+        "overlap_resolution_minimum_m2": OVERLAP_RESOLUTION_MIN_M2,
+        "overlap_resolution_smaller_footprint_fraction": OVERLAP_RESOLUTION_SMALLER_FRACTION,
+        "method": "Reduced portfolio vector workflow: retain the most recent footprint when intersection covers at least 20% of the smaller footprint; smaller overlaps remain. Use the former OSM > other Overture > 3D-GloBFP order only to break equal or unknown dates.",
     }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary), flush=True)
