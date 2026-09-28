@@ -22,7 +22,7 @@ Cell 5 removes the Overture buildings identified during the overlap analysis. It
 
 Cell 6 merges the cleaned Overture and GloBFP layers into a single integrated building layer called all_buildings_25d_cleaned_integrated. 
 
-Cell 7 removes small buildings that fall outside the GHS Urban Centre Database (GHS-UCDB) polygons. It reads the integrated building layer and the GHS-UCDB polygon layer, reprojects the polygon layer when necessary so both datasets use the same CRS, and uses a spatial join to identify buildings that intersect a GHS-UCDB polygon. Buildings are removed only when both conditions are true: the building has area_m2 < 16 and it does not overlap a GHS-UCDB polygon. Small buildings inside the GHS-UCDB areas are retained.
+Cell 7 removes small buildings that fall inside the GHS Urban Centre Database (GHS-UCDB) polygons. It reads the integrated building layer and the GHS-UCDB polygon layer, reprojects the polygon layer when necessary so both datasets use the same CRS, and uses a spatial join to identify buildings that intersect a GHS-UCDB polygon. Buildings are removed only when both conditions are true: the building has area_m2 < 16 and it overlaps a GHS-UCDB polygon. Small buildings inside the GHS-UCDB areas are retained.
 
 Cell 8 removes nested building polygons that are completely contained within another building footprint. It performs a self-spatial join using the within predicate to identify buildings contained by other buildings, removes self-matches, and compares the areas of the contained and containing polygons. When the containing polygon is larger, the larger containing polygon is removed, leaving the smaller contained footprint. 
 
