@@ -1,6 +1,6 @@
 # Missing Buildings per Segment
 
-This workflow identifies potential missing building locations using World Settlement Footprint (WSF) data and existing building footprints, then summarizes the resulting missing WSF locations by segment.
+This workflow identifies potential missing building locations using World Settlement Footprint (WSF) data and existing building footprints from the integrated building footprint layer, then summarizes the resulting missing WSF locations by segment.
 
 The workflow supports two different WSF input formats:
 
