@@ -7,7 +7,7 @@ The workflow supports two different WSF input formats:
 * **20-band WSF imagery** for Tripoli, Dakar, and Garissa
 * **1-band WSF mode imagery** for Juba, Johannesburg, and Kigali
 
-Only one of the two WSF processing cells is run, depending on the format of the input WSF raster. After either WSF workflow is completed, the segment-level aggregation cell is run.
+Only one of the two WSF processing cells is run, depending on the format of the input WSF raster. After either WSF workflow is completed, the segment-level aggregation cells are run.
 
 ## Notebook
 
@@ -33,6 +33,18 @@ Only one of the two WSF processing cells is run, depending on the format of the 
                 Segment polygons
                        │
           missing_1_year / missing_3_year
+                       │
+                     Cell 4
+                       │
+          Building and WSF statistics
+                       │
+       ┌───────────────┴────────────────┐
+       │                                │
+  2023 building/WSF ratio       Estimated missing buildings
+       │                                │
+       └───────────────┬────────────────┘
+                       │
+             Segment-level statistics
 ```
 
 ## Cell 1: New WSF from 20-Band Imagery
@@ -235,6 +247,140 @@ No percentages are calculated.
 
 Segments without missing WSF points receive a value of `0`.
 
+---
+
+## Cell 4: Calculate Building and WSF Segment Statistics
+
+### `Get segment stats for building and WSF pixel counts`
+
+Cell 4 uses the segment layer produced by Cell 3 and adds building and WSF statistics to each segment.
+
+The workflow uses:
+
+* integrated building points from 2023
+* 2023 WSF points
+* 2026 WSF points
+* the `missing_1_year` field from Cell 3
+* the `missing_3_year` field from Cell 3
+
+The segment identifier is the `OBJECTID` field.
+
+### 1. Count 2023 building points
+
+A spatial join is performed between the segment polygons and the integrated 2023 building points using:
+
+```text
+JOIN_ONE_TO_ONE
+KEEP_ALL
+INTERSECT
+```
+
+The resulting building count is stored in:
+
+```text
+integrated_building_count_2023
+```
+
+Segments without building points receive a value of `0`.
+
+### 2. Count 2023 WSF pixels
+
+A spatial join counts the 2023 WSF points within each segment.
+
+The resulting count is stored in:
+
+```text
+wsf_pixel_count_2023
+```
+
+Segments without 2023 WSF points receive a value of `0`.
+
+### 3. Calculate the building-to-WSF ratio
+
+For segments with at least one 2023 WSF point, the workflow calculates:
+
+```text
+building_wsf_ratio =
+    integrated_building_count_2023 /
+    wsf_pixel_count_2023
+```
+
+If the segment has zero 2023 WSF points, `building_wsf_ratio` is set to `NULL`.
+
+This ratio is subsequently used to convert WSF pixel counts into estimated building counts.
+
+### 4. Count 2026 WSF pixels
+
+A spatial join counts the 2026 WSF points within each segment.
+
+The resulting count is stored in:
+
+```text
+wsf_pixel_count_2026
+```
+
+Segments without 2026 WSF points receive a value of `0`.
+
+### 5. Estimate the 2026 building count
+
+The 2023 building-to-WSF ratio is applied to the 2026 WSF count:
+
+```text
+building_count_estimated_2026 =
+    wsf_pixel_count_2026 *
+    building_wsf_ratio
+```
+
+The estimate is only calculated when both the 2026 WSF count and the building/WSF ratio are available.
+
+Otherwise, the field is set to `NULL`.
+
+### 6. Estimate missing buildings for one year
+
+The `missing_1_year` value from Cell 3 is converted from a missing WSF point count into an estimated missing building count using the segment's 2023 building-to-WSF ratio:
+
+```text
+estimated_missing_count_1_year =
+    missing_1_year *
+    building_wsf_ratio
+```
+
+If either `missing_1_year` or `building_wsf_ratio` is `NULL`, the estimated value is also set to `NULL`.
+
+### 7. Estimate missing buildings for three years
+
+The same calculation is performed for the three-year missing WSF count:
+
+```text
+estimated_missing_count_3_year =
+    missing_3_year *
+    building_wsf_ratio
+```
+
+If either `missing_3_year` or `building_wsf_ratio` is `NULL`, the estimated value is set to `NULL`.
+
+### Output fields
+
+Cell 4 creates or updates seven segment-level fields:
+
+| Field                            | Description                                                        |
+| -------------------------------- | ------------------------------------------------------------------ |
+| `integrated_building_count_2023` | Number of integrated 2023 building points within the segment       |
+| `wsf_pixel_count_2023`           | Number of 2023 WSF points within the segment                       |
+| `building_wsf_ratio`             | 2023 building point count divided by 2023 WSF point count          |
+| `wsf_pixel_count_2026`           | Number of 2026 WSF points within the segment                       |
+| `building_count_estimated_2026`  | Estimated 2026 building count based on the 2023 building/WSF ratio |
+| `estimated_missing_count_1_year` | Estimated missing buildings based on the 1-year missing WSF count  |
+| `estimated_missing_count_3_year` | Estimated missing buildings based on the 3-year missing WSF count  |
+
+The final two fields are calculated as:
+
+```text
+missing WSF points × 2023 building/WSF ratio
+```
+
+---
+
 ## Input Data
 
 ### WSF data
@@ -281,29 +427,38 @@ The building layer follows the pattern:
 buildings_{CITY}_9_13_cleaned
 ```
 
+### Segment polygons
+
+The segment layer used by Cells 3 and 4 is:
+
+```text
+segments_6_cities
+```
+
+within:
+
+```text
+E:\WSF\wsf_work_arc\wsf_work_arc.gdb
+```
+
 ## Outputs
 
-The WSF processing cells produce intermediate raster and point datasets.
+### WSF processing outputs
 
-### Raster outputs
+The WSF processing cells produce intermediate raster and point datasets.
 
 Depending on the processing path, outputs include:
 
 * new/filtered WSF raster
 * rasterized building footprints
 * WSF pixels remaining after building removal
-
-### Point outputs
-
-The workflows produce:
-
 * all selected WSF points
 * missing WSF points
 * filtered missing WSF points
 
-The filtered missing WSF points are the primary input to the segment-level calculation.
+The filtered missing WSF points are the primary input to Cell 3.
 
-### Segment output
+### Segment output after Cell 3
 
 Cell 3 updates the segment polygon layer with:
 
@@ -313,6 +468,22 @@ missing_3_year
 ```
 
 These fields contain the number of filtered missing WSF points intersecting each segment.
+
+### Segment output after Cell 4
+
+Cell 4 adds the building and WSF statistics:
+
+```text
+integrated_building_count_2023
+wsf_pixel_count_2023
+building_wsf_ratio
+wsf_pixel_count_2026
+building_count_estimated_2026
+estimated_missing_count_1_year
+estimated_missing_count_3_year
+```
+
+The segment layer is updated in place rather than creating a separate output layer.
 
 ## Processing Logic
 
@@ -346,7 +517,36 @@ Count missing points per segment
        ├── missing_1_year
        │
        └── missing_3_year
+                  │
+                  ▼
+       Calculate 2023 building/WSF ratio
+                  │
+                  ▼
+       Count 2026 WSF pixels
+                  │
+                  ├──► building_count_estimated_2026
+                  │
+                  ├──► estimated_missing_count_1_year
+                  │
+                  └──► estimated_missing_count_3_year
 ```
+
+The estimation relationships are:
+
+```text
+building_wsf_ratio =
+    2023 building count / 2023 WSF count
+
+building_count_estimated_2026 =
+    2026 WSF count × building_wsf_ratio
+
+estimated_missing_count_1_year =
+    missing_1_year × building_wsf_ratio
+
+estimated_missing_count_3_year =
+    missing_3_year × building_wsf_ratio
+```
+
 
 ## Requirements
 
@@ -356,19 +556,37 @@ Count missing points per segment
 * Image Analyst extension for the 20-band workflow
 * WSF raster data
 * Existing building footprint data
+* Integrated building point data
+* 2023 WSF point data
+* 2026 WSF point data
 * Segment polygon data
 
-## Selecting the Processing Cell
+## Processing Order
 
-Use **Cell 1** when the WSF input is a 20-band raster with individual WSF observations for different dates/years.
+The notebook should be run in the following order:
 
-Use **Cell 2** when the WSF input is a one-band raster containing the WSF `mode` value.
-
-After running either Cell 1 or Cell 2, run **Cell 3** to aggregate the filtered missing WSF points to the segment polygons.
+### For 20-band WSF data
 
 ```text
-20-band WSF ──► Cell 1 ──┐
-                         ├──► Cell 3 ──► Segment missing counts
-1-band mode WSF ─► Cell 2 ─┘
+Cell 1
+  ↓
+Cell 3
+  ↓
+Cell 4
 ```
+
+### For 1-band mode WSF data
+
+```text
+Cell 2
+  ↓
+Cell 3
+  ↓
+Cell 4
+```
+
+Cell 1 and Cell 2 are alternative WSF preprocessing workflows. **Only one should be run for a given input dataset.**
+
+Cell 3 calculates the missing WSF counts per segment, and Cell 4 combines those counts with the building/WSF relationship to produce estimated missing building counts.
+
 
