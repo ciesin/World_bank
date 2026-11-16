@@ -22,7 +22,8 @@
 #           overlay onto SEGMENTS (they rest on 2023 footprints not available
 #           here); blocks inherit their segment's ratios, so block new-building
 #           estimates sum to the segment's
-#   Step 6  Assemble; new buildings = new WSF pixels x ratio; complexity flags
+#   Step 6  Assemble; new buildings = new WSF pixels x ratio; total buildings
+#           (Jan 2026) = WSF pixels impervious by Jan 2026 x ratio; complexity flags
 #           and NN summaries (Integrated buildings); write both layers
 #   Population (pop_lsm_ambient, LandScan Mosaic) is summed per block in
 #   2_segment_coverAOI.R and carried in blocks_cln2 / segments_cln2.
@@ -41,8 +42,8 @@
 #
 # INPUT   <city>_blocks_segments_metrics_coverAOI.gpkg, layers "blocks_cln2"
 #         and "segments_cln2" (outputs of 2_segment_coverAOI.R); SPARC AOI
-# OUTPUT  <city>_blocks_segments_complete_in_AOI_cln4.gpkg, layers
-#         "blocks_cln4" and "segments_cln4" (linked by segment_id)
+# OUTPUT  <city>_blocks_segments_complete_in_AOI_final.gpkg, layers
+#         "blocks_final" and "segments_final" (linked by segment_id)
 # =============================================================================
 
 rm(list = ls())
@@ -93,10 +94,10 @@ cfg <- list(
 
 seg_layer     <- "segments_cln2"      # input layers (outputs of 2_segment)
 blk_layer     <- "blocks_cln2"
-out_seg_layer <- "segments_cln4"      # output layers
-out_blk_layer <- "blocks_cln4"
+out_seg_layer <- "segments_final"      # output layers
+out_blk_layer <- "blocks_final"
 zone_field    <- "zones_5_ID"         # block zone attribute
-cities    <- "juba"  #names(cfg)                 # or e.g. "juba" to run one city
+cities    <- names(cfg)                 # or e.g. "juba" to run one city
 
 force_full      <- FALSE                # TRUE = recompute everything (ignore the cache)
 cache_buildings <- TRUE                 # cache the cleaned building layers as .rds
@@ -319,15 +320,18 @@ read_polys <- function(path, crs, layer = NULL, keep = character(0)) {
   st_collection_extract(x, "POLYGON", warn = FALSE)
 }
 
-# Complex morphology (Integrated buildings; nn_* = buildings within 50 m).
-# A building is flagged if either rule holds:
-#   rule A  footprint > 500 m2 AND >= 100 neighbours      (large building in a crowded fabric)
-#   rule B  > 12 neighbours AND mean neighbour area < 35 m2 (dense cluster of very small buildings)
-# Buildings are assigned to segments by point-on-surface, as for intgr_bldg_ct.
-# A block or segment is flagged (cmplx_flag = 1) if it holds >= seg_min_n
-# flagged buildings and their share is >= seg_min_share.
-cmplx <- list(a_area = 500, a_nn = 100, b_nn = 12, b_size = 35,
-              seg_min_n = 3, seg_min_share = 0)   # unit flag thresholds (blocks and segments)
+# Complex morphology (Integrated buildings).
+#   Rule A (building level): footprint > a_area m2 AND >= a_nn neighbours within
+#          50 m (large, likely merged building in a crowded fabric). A unit
+#          meets rule A when it holds >= seg_min_n such buildings.
+#   Rule B (unit level): the block or segment has > dens_min integrated
+#          buildings per ha (intgr_bldg_ct_dens_06_2026); dense clusters of
+#          small buildings. All of the unit's buildings then count as rule B.
+#   cmplx_flag = 1 if the unit meets rule A or rule B.
+# Buildings are assigned to units by point-on-surface, as for intgr_bldg_ct.
+cmplx <- list(a_area = 500, a_nn = 100,   # rule A (building level)
+              seg_min_n = 3,              # rule A buildings needed to flag a unit
+              dens_min = 50)              # rule B: buildings/ha, unit level (strictly greater)
 
 nn_fields <- c("nn_count_50m", "nn_size_mean", "nn_size_min", "nn_size_max", "nn_edge_dist_mean_m")
 
@@ -355,21 +359,23 @@ nn_aggregates <- function(ci, seg) {
     arrange(seg_row)
 }
 
-complexity_stats <- function(seg_pt, b_area, nn_count, nn_size_mean, seg) {
+# Complexity per unit. dense_units = seg_row of units meeting rule B.
+complexity_stats <- function(seg_pt, b_area, nn_count, seg, dense_units = integer(0)) {
   rule_a <- !is.na(nn_count) & b_area > cmplx$a_area & nn_count >= cmplx$a_nn
-  rule_b <- !is.na(nn_count) & !is.na(nn_size_mean) &
-    nn_count > cmplx$b_nn & nn_size_mean < cmplx$b_size
-  d <- data.frame(seg_row = seg_pt, a = rule_a, b = rule_b) |> filter(!is.na(seg_row)) |>
+  d <- data.frame(seg_row = seg_pt, a = rule_a) |> filter(!is.na(seg_row)) |>
     group_by(seg_row) |>
-    summarise(n = n(), na = sum(a), nb = sum(b), nab = sum(a | b), .groups = "drop")
+    summarise(n = n(), na = sum(a), .groups = "drop")
   data.frame(seg_row = seg$seg_row) |> left_join(d, by = "seg_row") |>
+    mutate(n = coalesce(n, 0L), na = coalesce(na, 0L),
+           dense = seg_row %in% dense_units) |>
     transmute(seg_row,
-              cmplx_bldg_ct_large = coalesce(na, 0L),
-              cmplx_bldg_ct_small = coalesce(nb, 0L),
-              cmplx_bldg_ct       = coalesce(nab, 0L),
-              cmplx_bldg_share    = ifelse(coalesce(n, 0L) > 0, nab / n, NA_real_),
-              cmplx_flag = as.integer(cmplx_bldg_ct >= cmplx$seg_min_n &
-                                        coalesce(cmplx_bldg_share, 0) >= cmplx$seg_min_share))
+              cmplx_bldg_ct_large = na,
+              cmplx_bldg_ct_small = ifelse(dense, n, 0L),
+              cmplx_bldg_ct       = ifelse(dense, n, na),
+              cmplx_bldg_share    = ifelse(n > 0, cmplx_bldg_ct / n, NA_real_),
+              cmplx_flag_large    = as.integer(na >= cmplx$seg_min_n),
+              cmplx_flag_small    = as.integer(dense),
+              cmplx_flag          = as.integer(cmplx_flag_large == 1 | cmplx_flag_small == 1))
 }
 
 # WSF pixel counts: a cell belongs to the segment containing its centre
@@ -429,10 +435,10 @@ common_fields <- c(
   paste0("ovr_", bstat, "_06_2026"), paste0("intgr_", bstat, "_06_2026"),
   "pop_lsm_ambient", "pop_per_ha",
   names(wsf_steps),
-  "ovr_bldg_wsf_ratio", "ovr_new_bldgs_1yr", "ovr_new_bldgs_3yr",
-  "intgr_bldg_wsf_ratio", "intgr_new_bldgs_last_1yr", "intgr_new_bldgs_last_3yr",
+  "ovr_bldg_wsf_ratio", "wsf_est_bldgs_01_2026_ovr", "ovr_new_bldgs_1yr", "ovr_new_bldgs_3yr",
+  "intgr_bldg_wsf_ratio", "wsf_est_bldgs_01_2026_intgr", "intgr_new_bldgs_last_1yr", "intgr_new_bldgs_last_3yr",
   "cmplx_bldg_ct_large", "cmplx_bldg_ct_small", "cmplx_bldg_ct",
-  "cmplx_bldg_share", "cmplx_flag",
+  "cmplx_bldg_share", "cmplx_flag_large", "cmplx_flag_small", "cmplx_flag",
   "nn_count_med", "nn_count_p90", "nn_size_mean_med", "nn_size_mean_cv",
   "nn_size_min_med", "nn_size_max_med", "nn_edge_dist_med_m",
   "bldg_gt500_ct")
@@ -527,14 +533,19 @@ for (city in cities) {
     ci <- data.frame(seg_pt = x$u_of_blk[bt_int$bt$pt_blk], b_area = bt_int$bt$b_area,
                      bt_int$bt[nn_fields])
     ci <- ci[!is.na(ci$seg_pt), ]
+    si <- unit_stats(bt_int, x$u_of_blk, ud, "intgr", "06_2026")
+    dense <- si$seg_row[si$intgr_bldg_ct_dens_06_2026 > cmplx$dens_min]    # rule B (unit level)
     fin[[l]] <- x$u |>
       left_join(unit_stats(bt_ovr, x$u_of_blk, ud, "ovr",   "06_2026"), by = "seg_row") |>
-      left_join(unit_stats(bt_int, x$u_of_blk, ud, "intgr", "06_2026"), by = "seg_row") |>
+      left_join(si, by = "seg_row") |>
       left_join(x$wsf, by = "seg_row") |>
       left_join(x$ratios, by = "seg_row") |>
-      left_join(with(ci, complexity_stats(seg_pt, b_area, nn_count_50m, nn_size_mean, ud)), by = "seg_row") |>
+      left_join(with(ci, complexity_stats(seg_pt, b_area, nn_count_50m, ud, dense)),
+                by = "seg_row") |>
       left_join(nn_aggregates(ci, ud), by = "seg_row") |>
-      mutate(ovr_new_bldgs_1yr        = new_wsf_pixel_last_1yr  * ovr_bldg_wsf_ratio,
+      mutate(wsf_est_bldgs_01_2026_ovr = wsf_pixel_ct_01_2026    * ovr_bldg_wsf_ratio,
+             wsf_est_bldgs_01_2026_intgr = wsf_pixel_ct_01_2026    * intgr_bldg_wsf_ratio,
+             ovr_new_bldgs_1yr        = new_wsf_pixel_last_1yr  * ovr_bldg_wsf_ratio,
              ovr_new_bldgs_3yr        = new_wsf_pixel_last_3yrs * ovr_bldg_wsf_ratio,
              intgr_new_bldgs_last_1yr = new_wsf_pixel_last_1yr  * intgr_bldg_wsf_ratio,
              intgr_new_bldgs_last_3yr = new_wsf_pixel_last_3yrs * intgr_bldg_wsf_ratio)
@@ -548,10 +559,10 @@ for (city in cities) {
   message(sprintf("  segments < 95%% OLDseg cover: %d", sum(fin$seg$oldseg_cover_share < 0.95)))
   
   # Write both layers to one GeoPackage
-  out <- file.path(aug_dir, paste0(city, "_blocks_segments_complete_in_AOI_cln4.gpkg"))
-  if (file.exists(out)) file.remove(out)
-  st_write(fin$blk, out, layer = out_blk_layer, quiet = TRUE)
-  st_write(fin$seg, out, layer = out_seg_layer, quiet = TRUE)
+  out <- file.path(aug_dir, paste0(city, "_blocks_segments_complete_in_AOI_final.gpkg"))
+  # Layers are replaced in place; close the file in QGIS/ArcGIS first (a lock blocks the write)
+  st_write(fin$blk, out, layer = out_blk_layer, delete_layer = TRUE, quiet = TRUE)
+  st_write(fin$seg, out, layer = out_seg_layer, delete_layer = TRUE, quiet = TRUE)
   message("  wrote ", out, " [", out_blk_layer, ", ", out_seg_layer, "]")
   
   # Replace the cache with this run's results (basis for the next comparison)

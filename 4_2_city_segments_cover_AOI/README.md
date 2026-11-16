@@ -17,7 +17,7 @@ Run the scripts in order. Each script reads the previous script's output; the su
 | `1_blocks_coverAOI.R` | Clips GRID3 blocks to the AOI, resolves enclosed blocks ("donuts"), divides the remaining space into void units (skeleton split, 10 ha hexagons, small pieces merged), and counts Overture buildings per unit | layer `blocks_cln1` |
 | `2_segment_coverAOI.R` | Cleans blocks and void units (small units merged, void units cut at narrow necks), sums LandScan-Mosaic-Ambient population per unit, assigns units to the original segments, forms new segments, then splits and merges segments along major linear breaks to meet size and shape rules | layers `blocks_cln2`, `segments_cln2`, `breaks_cln2` |
 | `3_stats_grid3Vaugmented.R` | Summary statistics comparing original and augmented segments (report Table 4.9) | `table_4_9_metrics_cln3.csv` |
-| `4_segment_coverAOI_attributes.R` | Building statistics (Overture and integrated layers), WSF Tracker counts, building:WSF ratios, new-building estimates, and complex-morphology flags for every block and segment | `<city>_blocks_segments_complete_in_AOI_cln4.gpkg` with layers `blocks_cln4`, `segments_cln4` |
+| `4_segment_coverAOI_attributes.R` | Building statistics (Overture and integrated layers), WSF Tracker counts, building:WSF ratios, new-building estimates, and complex-morphology flags for every block and segment | `<city>_blocks_segments_complete_in_AOI_final.gpkg` with layers `blocks_final`, `segments_final` |
 
 The final deliverable is the output of script 4: one GeoPackage per city, with a block layer and a segment layer linked by `segment_id`.
 
@@ -79,7 +79,7 @@ All outputs are written to the output folder set in each script.
 
 **`table_4_9_metrics_cln3.csv`** (script 3): counts, median areas, and AOI coverage of original and augmented segments.
 
-**`<city>_blocks_segments_complete_in_AOI_cln4.gpkg`** (script 4): final deliverable.
+**`<city>_blocks_segments_complete_in_AOI_final.gpkg`** (script 4): final deliverable.
 
 | Group | Fields | Blocks | Segments |
 |---|---|:-:|:-:|
