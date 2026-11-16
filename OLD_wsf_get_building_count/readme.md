@@ -1,6 +1,6 @@
 # Segment-Level Building and WSF Statistics
 
-This workflow calculates segment-level statistics relating integrated building counts to World Settlement Footprint (WSF) pixel counts.
+This workflow calculates segment-level statistics relating integrated building counts to World Settlement Footprint (WSF) pixel counts. This workflow was intially applied to an earlier version of augmented blocks and segments. The computed ratios of 2023 building counts vs 2023 WSF Tracker impervious surface was not recomputed for the final augmented blocks and segments; instead the ratios computed in these geometries were joined to the final augmented blocks and segments based on proximity.
 
 The workflow uses existing **building points**, **2023 WSF points**, and **2026 WSF points** to calculate building and WSF counts for each segment. It then uses the 2023 building-to-WSF relationship to estimate the number of buildings represented by the 2026 WSF pixels.
 

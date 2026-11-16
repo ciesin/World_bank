@@ -4,6 +4,8 @@
 # Project : World Bank LandAtlas / SPARC Urban Analytics Platform
 # Author  : Dana Thomson, CIESIN, Columbia University
 # Created : 2026-11-08
+# Revised : 2026-11-15  population (LandScan Mosaic) replaces building
+#                      counts in all split/merge decisions
 #
 # DESCRIPTION
 #   Groups the AOI block coverage (output of blocks_segments_metrics_coverAOI.R)
@@ -18,6 +20,11 @@
 #     2. Read the block coverage; drop artifact polygons; merge each
 #        still_small polygon into the neighbor sharing its longest edge;
 #        reassign detached fragments
+#     2a. Cut void units at pinch points (narrow necks); merge the cut-off
+#        fragments into a neighbor other than their parent (GRID3 blocks
+#        are not cut)
+#     2b. Sum LandScan Mosaic population per block (exactextractr,
+#        area-weighted cell fractions)               -> pop_lsm_ambient (cached)
 #     3. Detect shared edges between blocks and derive major linear breaks
 #        ("strokes") from them
 #     4. Assign blocks to original segment parts: (a) by area of overlap,
@@ -33,7 +40,7 @@
 #        d. merge tiny segments into the neighbor with the longest edge
 #        e. merge segments with exactly one neighbor into it (donuts)
 #        f. group sparsely settled segments into compact segments
-#        g. merge stranded segments with few buildings into a neighbor,
+#        g. merge stranded segments with few people into a neighbor,
 #           preferring the same zone
 #     7. Dissolve blocks into segments; heal; fill empty holes
 #     8. Add blocks, segments and breaks as new layers to the block
@@ -43,15 +50,21 @@
 #   Set `run_cities` in SECTION 1 to one or more of the cities in `cities`,
 #   then source the whole script. Cities are processed one at a time.
 #
-# INPUTS (per city; see `cities` in SECTION 1)
-#   <city>_blocks_segments_metrics.gpkg           layer "segments"
-#   <city>_blocks_segments_metrics_coverAOI.gpkg  layer "blocks"
+# INPUTS (per city; see `cities`, `seg_dir`, `blk_dir` in SECTION 1)
+#   <seg_dir>/<city>_blocks_segments_metrics.gpkg           layer "segments"
+#   <blk_dir>/<city>_blocks_segments_metrics_coverAOI.gpkg  layer "blocks_cln1"
+#            (output of 1_blocks_coverAOI.R)
+#   LandScan Mosaic population raster (GeoTIFF) for the city's country;
+#   see `landscan` in SECTION 1
 #
 # OUTPUT
 #   Layers added to <city>_blocks_segments_metrics_coverAOI.gpkg. The input
-#   "blocks" layer is read only and never modified; on rerun the output
-#   layers are replaced. Population is not used and is dropped.
-#     blocks_cln1    block coverage after merging still_small polygons
+#   "blocks_cln1" layer is read only and never modified; on rerun the output
+#   layers are replaced. The input `population` field is dropped; population
+#   comes from LandScan Mosaic (pop_lsm_ambient). Per-block population is cached in
+#   <root>/_cache/<city>_cln2_pop_ls.rds and reused while the block IDs are
+#   unchanged.
+#     blocks_cln2    block coverage after merging still_small polygons
 #                    seg_part_ID        final segment of the block
 #                    seg_source         "original" (from, or split from, an
 #                                       original segment) or "new"
@@ -64,8 +77,10 @@
 #                    dist_to_seg_part   distance from the centroid to
 #                                       seg_part_nearest (m); 0 if inside it
 #                    n_merged           polygons combined into the block
+#                    pop_lsm_ambient             LandScan Mosaic population (sum of
+#                                       cell values x share of cell covered)
 #                    <block coverage attributes>
-#     segments_cln1  blocks dissolved by seg_part_ID
+#     segments_cln2  blocks dissolved by seg_part_ID
 #                    seg_part_ID        segment ID (original segment part ID,
 #                                       or a new ID above the original range)
 #                    seg_source         "original" or "new"
@@ -75,6 +90,8 @@
 #                    area_m2, area_ha   area of the segment
 #                    bldg_cnt, bldg_area_m2  sums over blocks
 #                    bldg_per_ha        buildings per hectare
+#                    pop_lsm_ambient             LandScan Mosaic population
+#                    pop_per_ha         people per hectare
 #                    zone_id            dominant `zone_field` value of the
 #                                       segment's blocks (by area)
 #                    seg_part_area_m2   area of the source segment part
@@ -85,10 +102,11 @@
 #                                       disc; lower = less compact)
 #                    n_holes            interior rings (enclosed segments
 #                                       that could not be merged)
-#     breaks_cln1    shared block edges (arcs) with stroke attributes, for
+#     breaks_cln2    shared block edges (arcs) with stroke attributes, for
 #                    review of the major linear breaks
 #                    stroke_id, stroke_len_m, arc_len_m, block_i, block_j
-#                    (block_i, block_j = block_id_coverAOI)
+#                    (block_i, block_j = block_id_coverAOI); arc_parent =
+#                    arc before cutting at bends
 #
 # METHOD
 #   Step 1  Segments are made valid and exploded to single polygons. Each
@@ -105,6 +123,15 @@
 #           Zone preference applies (see Zones). Detached parts of merged
 #           polygons, other than the largest, are moved to the adjacent
 #           polygon sharing their longest edge.
+#   Step 2a Void units (hex_ids not NA) only. Each is opened morphologically
+#           (inward then outward buffer of neck_width_m / 2); parts narrower
+#           than `neck_width_m` drop out. A dropped-out piece is cut off if it
+#           is >= `min_frag_m2` or it is a neck (touches two separate wide
+#           parts). Remaining parts of the unit other than the largest are
+#           cut off too. Smaller dropped-out pieces (rounded corners) stay.
+#           Fragments merge like still_small polygons (longest edge, zone
+#           tiers) but never into a part of the same parent unit; sum_fields
+#           are split by area share. Unmerged fragments keep a new ID.
 #   Zones   `zone_field` (NA = no zone; typically void units) is preserved
 #           where possible:
 #           - merges (Steps 2, 6d, 6f, 6g) process no-zone polygons first and
@@ -128,6 +155,13 @@
 #           neighbor form an arc; each boundary is drawn once. Block pairs
 #           sharing >= `min_edge_m` are adjacent; this adjacency is used in
 #           all later steps.
+#           Bends. Each arc is cut at interior vertices where it turns by
+#           more than `bend_max_deflect` degrees, measured between the
+#           vertices `bend_look_m` before and after (local maxima only; cuts
+#           >= `bend_look_m` apart). The cut ends meet at a junction whose
+#           deflection exceeds the stroke limit, so a sharp bend ends a
+#           stroke just as a junction does; without this, a long snaking
+#           boundary with few junctions forms one long stroke.
 #           Strokes. Arc ends within `edge_snap_m` of each other form a
 #           junction. At each junction, arc ends are paired greedily by
 #           smallest deflection angle (direction measured over the last
@@ -151,22 +185,23 @@
 #           no-zone blocks form connected clusters. Each cluster is a new
 #           segment.
 #   Step 6  Segments are refined on block labels, using block adjacency,
-#           areas, building counts, centroids and break strengths;
+#           areas, population (pop_lsm_ambient), centroids and break strengths;
 #           geometry is dissolved only in Step 7. Each pass runs the splits
 #           (a-b), then the merges (c-g), so a pass ends without donuts or
 #           stranded units. Passes repeat until labels no longer change or
 #           `max_iter` is reached.
-#           (a) Large: a segment exceeding `target_ha` or `bldg_soft_max`
+#           (a) Large: a segment exceeding `pop_soft_max` (every pass) or `target_ha`
 #               (first pass) or `hard_max_ha` (later passes) is split along
 #               its strongest breaks. Its blocks form a minimum spanning tree
 #               on break strength (Kruskal); the tree is cut recursively,
 #               and by the MST cycle property every boundary crossing a cut
 #               has a break strength >= that of the removed edge. Parts must
-#               be >= `min_piece_ha` unless the region exceeds `hard_max_ha`.
+#               be >= `min_piece_ha` or >= `min_piece_pop` people, unless the
+#               region exceeds `hard_max_ha`.
 #               Cut score: (strength / max strength) *
 #               (2 * balance) ^ balance_weight, where balance =
 #               min(load_a, load_b) / (load_a + load_b) and load =
-#               max(area / target_ha, buildings / bldg_soft_max).
+#               max(area / target_ha, population / pop_soft_max).
 #           (b) Non-compact: compactness is the normalized moment of
 #               inertia J = 2 * pi * I / A^2 of the segment's blocks
 #               (centroids weighted by area, blocks treated as discs).
@@ -180,21 +215,24 @@
 #               (strength / max strength) ^ strength_weight.
 #           (c) Disconnected: a segment whose blocks form more than one
 #               connected group is separated; the largest group keeps the ID.
-#           (d) Tiny: segments < `min_seg_ha` merge into the neighbor
+#           (d) Tiny: segments < `min_seg_ha` and < `min_seg_pop` people merge into the neighbor
 #               sharing the longest edge.
 #           (e) Donuts: a segment with exactly one neighbor (enclosed by it,
 #               or attached only to it) merges into that neighbor.
-#           (f) Sparse: segments with < `density_max` buildings per hectare
+#           (f) Sparse: segments with < `density_max` people per hectare
 #               and area < `max_ha` merge (no-zone first, then smallest)
 #               into (1) a zoned neighbor of any density (same zone if the
 #               segment has a zone), longest edge; otherwise (2) a sparse
 #               no-zone neighbor, then (3) any sparse neighbor, choosing the
 #               most compact result (lowest J). The result must stay
-#               <= `max_ha`.
-#           (g) Stranded: segments with < `bldg_threshold` buildings and
+#               <= `max_ha` and <= `pop_soft_max` people.
+#           (g) Stranded: segments with < `pop_threshold` people and
 #               area < `max_ha` merge by zone tier and longest edge.
-#           Merges (d, e, g) are skipped if the result would exceed
-#           `hard_max_ha`. Merged segments keep the receiving segment's ID.
+#           Merges (d, g) prefer, within each zone tier, the longest-edge
+#           neighbor for which the result stays <= `target_ha` and
+#           <= `pop_soft_max` (so it is not split again in the next pass);
+#           otherwise the longest-edge neighbor within `hard_max_ha`. Merges
+#           (d, e, g) are skipped if the result would exceed `hard_max_ha`. Merged segments keep the receiving segment's ID.
 #           Split parts inherit the parent's source; the largest part keeps
 #           the parent's ID.
 #   Step 7  Blocks are dissolved by seg_part_ID and healed (closing of
@@ -212,7 +250,7 @@
 #     Conference, Ottawa.
 #
 # DEPENDENCIES
-#   R >= 4.1; sf >= 1.0 (GEOS >= 3.8); dplyr >= 1.1
+#   R >= 4.1; sf >= 1.0 (GEOS >= 3.8); dplyr >= 1.1; terra; exactextractr
 # =============================================================================
 
 rm(list = ls())
@@ -220,6 +258,8 @@ rm(list = ls())
 suppressPackageStartupMessages({
   library(sf)
   library(dplyr)
+  library(terra)
+  library(exactextractr)
 })
 
 sf_use_s2(FALSE)
@@ -229,9 +269,11 @@ sf_use_s2(FALSE)
 # -----------------------------------------------------------------------------
 
 # Cities to process: any subset of cities$city
-run_cities <- c("juba", "kigali", "johannesburg")
+run_cities <- c("juba") #c("juba", "kigali", "johannesburg")
 
-root <- "//DATASERVER1/ScienceData$/dthomson/Documents/zzz_WORK/p_WB_LandAtlas/deliverables/Data - Revising block segment attributes"
+root    <- "//DATASERVER1/ScienceData$/dthomson/Documents/zzz_WORK/p_WB_LandAtlas/deliverables/Data - Revising block segment attributes"
+seg_dir <- file.path(root, "alex blocks segments")               # original segments (from Alex)
+blk_dir <- root                                                  # block coverage (output of 1_blocks_coverAOI.R)
 
 cities <- dplyr::tribble(
   ~city,          ~segments_file,                               ~blocks_file,
@@ -241,12 +283,24 @@ cities <- dplyr::tribble(
 )
 
 segments_layer     <- "segments"       # input layer in <city>_blocks_segments_metrics.gpkg
-blocks_layer       <- "blocks"         # input layer in the coverAOI file (read only)
-out_blocks_layer   <- "blocks_cln1"    # output layers in the coverAOI file
-out_segments_layer <- "segments_cln1"
-out_breaks_layer   <- "breaks_cln1"
+blocks_layer       <- "blocks_cln1"    # input layer in the coverAOI file (output of 1_blocks; read only)
+out_blocks_layer   <- "blocks_cln2"    # output layers in the coverAOI file
+out_segments_layer <- "segments_cln2"
+out_breaks_layer   <- "breaks_cln2"
 
 zone_field <- "zones_5_ID"             # zone attribute of the blocks (NA = no zone)
+
+# Step 2b: LandScan Mosaic population raster per city
+landscan_root <- "//DATASERVER1/ScienceData$/dthomson/Documents/zzz_WORK/Data/LandScan-Mosaic"
+landscan <- dplyr::tribble(
+  ~city,          ~file,
+  "juba",         file.path(landscan_root, "landscan-mosaic-southsudan-v1.tif"),
+  "kigali",       file.path(landscan_root, "landscan-mosaic-rwanda-v1.tif"),
+  "johannesburg", file.path(landscan_root, "landscan-mosaic-southafrica-v1.tif")
+)
+pop_field <- "pop_lsm_ambient"         # block/segment field holding LandScan Mosaic population
+cache_dir <- file.path(root, "_cache") # per-block population cache
+terraOptions(tempdir = "C:/temp/terra", memfrac = 0.7)
 
 # Step 2: artifacts and still_small merge
 merge_params <- list(
@@ -254,6 +308,13 @@ merge_params <- list(
   edge_tol_m = 0.01,     # tolerance for shared-edge detection (m)
   min_edge_m = 0.1,      # minimum shared-edge length for adjacency (m)
   gap_tol_m  = 2         # fallback: neighbors across a gap up to this width (m)
+)
+
+# Step 2a: pinch points in void units
+pinch_params <- list(
+  neck_width_m = 30,     # cut void units where they narrow to less than this (m)
+  min_frag_m2  = 5000,   # cut-off pieces must be at least this large (m2), unless a neck
+  quad_segs    = 4       # buffer segments per quarter circle (speed vs smoothness)
 )
 
 # Steps 3-6: shared edges, strokes, assignment, segment size
@@ -264,17 +325,21 @@ seg_params <- list(
   min_edge_m         = 1,     # minimum shared boundary for block adjacency (m)
   stroke_look_m      = 30,    # arc length used for direction at junctions (m)
   stroke_max_deflect = 40,    # max deflection for arcs to continue a stroke (deg)
+  bend_look_m        = 30,    # window before/after a vertex for measuring a bend (m)
+  bend_max_deflect   = 40,    # arcs are cut at interior bends sharper than this (deg)
   zone_break_m       = 5000,  # added to break strength across a zone boundary (m)
   overlap_min_share  = 0.5,   # min share of block area in an original segment part
   edge_assign_passes = 1,     # passes of longest-edge assignment (Step 4b)
   target_ha          = 50,    # split segments larger than this (ha)
   hard_max_ha        = 100,   # segments are kept below this (ha)
-  bldg_soft_max      = 1000,  # split segments with more buildings than this
-  min_piece_ha       = 5,     # min area of each part of a split (ha)
+  pop_soft_max       = 1500,  # split segments with more people than this (every pass)
+  min_piece_ha       = 5,     # min area of each part of a split (ha) ...
+  min_piece_pop      = 500,   # ... unless the part has at least this many people
   balance_weight     = 1,     # weight of balance vs break strength in cuts
-  min_seg_ha         = 5,     # merge segments smaller than this (ha)
+  min_seg_ha         = 5,     # merge segments smaller than this (ha) ...
+  min_seg_pop        = 500,   # ... and with fewer people than this
   split_original     = TRUE,  # allow splitting segments derived from originals
-  max_iter           = 3      # max refinement passes (Step 6)
+  max_iter           = 2      # max refinement passes (Step 6)
 )
 
 # Step 6b: non-compact segments
@@ -287,13 +352,13 @@ compact_params <- list(
 
 # Step 6f: sparsely settled segments
 sparse_params <- list(
-  density_max = 2,            # buildings per hectare below which a segment is sparse
+  density_max = 10,           # people per hectare below which a segment is sparse
   max_ha      = 50            # max area of a grouped sparse segment (ha)
 )
 
 # Step 6g: stranded segments
 stranded_params <- list(
-  bldg_threshold = 10,        # segments with fewer buildings than this ...
+  pop_threshold  = 50,        # segments with fewer people than this ...
   max_ha         = 10         # ... and smaller than this (ha) are stranded
 )
 
@@ -495,8 +560,95 @@ drop_artifacts <- function(x, p) {
   x[!tiny, ]
 }
 
+# Step 2a: cut void units at pinch points; merge fragments into neighbors
+cut_void_pinches <- function(x, p, fields) {
+  if (!"hex_ids" %in% names(x)) {
+    log_msg("WARNING: no hex_ids field; void units unknown, pinch cut skipped")
+    return(x)
+  }
+  void <- which(!is.na(x$hex_ids))
+  r  <- p$neck_width_m / 2
+  g  <- st_geometry(x)[void]
+  op <- st_buffer(st_buffer(g, -r, nQuadSegs = p$quad_segs), r, nQuadSegs = p$quad_segs)
+  a_op <- area_m2(op)
+  lost <- area_m2(g) - a_op
+  n_op <- ifelse(st_geometry_type(op) == "MULTIPOLYGON", lengths(op), 1L)
+  cand <- which(a_op > 0 & (lost >= p$min_frag_m2 | n_op > 1))  # large narrow parts, or a neck
+  
+  crs  <- st_crs(x)
+  body <- vector("list", length(cand))
+  frag <- vector("list", length(cand))
+  for (k in seq_along(cand)) {
+    gi <- st_sfc(g[[cand[k]]], crs = crs)
+    oi <- st_sfc(op[[cand[k]]], crs = crs)
+    d  <- suppressWarnings(st_cast(clean_polygons(st_difference(gi, oi)), "POLYGON"))
+    if (length(d) == 0) next
+    oparts <- suppressWarnings(st_cast(oi, "POLYGON"))
+    neck <- lengths(st_is_within_distance(d, oparts, 0.01)) >= 2
+    cut  <- d[area_m2(d) >= p$min_frag_m2 | neck]
+    if (length(cut) == 0) next
+    rest <- suppressWarnings(st_cast(clean_polygons(st_difference(gi, st_union(cut))), "POLYGON"))
+    if (length(rest) == 0) next
+    ra   <- area_m2(rest)
+    main <- which.max(ra)
+    body[[k]] <- st_union(rest[main])
+    frag[[k]] <- c(cut, rest[-main])
+  }
+  hit <- which(!vapply(body, is.null, logical(1)))
+  if (length(hit) == 0) {
+    log_msg("Pinch points: none cut")
+    return(x)
+  }
+  
+  rows  <- void[cand[hit]]
+  nfrag <- lengths(frag[hit])
+  fr    <- do.call(c, frag[hit])
+  par   <- rep(rows, nfrag)
+  
+  # Fragments: copies of the parent's attributes with new geometry and ID
+  f <- x[par, ]
+  st_geometry(f) <- st_cast(fr, "MULTIPOLYGON")
+  ids <- x$block_id_coverAOI
+  f$block_id_coverAOI <- if (is.numeric(ids)) max(ids) + seq_len(nrow(f)) else
+    paste0(ids[par], "_p", ave(par, par, FUN = seq_along))
+  f$n_merged <- 1L
+  
+  # Parent keeps its largest part
+  a_par <- area_m2(st_geometry(x)[rows])
+  st_geometry(x)[rows] <- st_cast(do.call(c, body[hit]), "MULTIPOLYGON")
+  
+  # Split summed fields by area share
+  fields <- setdiff(intersect(fields, names(x)), "area_m2")
+  sh_b <- area_m2(st_geometry(x)[rows]) / a_par
+  sh_f <- area_m2(st_geometry(f)) / rep(a_par, nfrag)
+  for (fld in fields) {
+    v <- as.numeric(x[[fld]])
+    f[[fld]]    <- v[par] * sh_f
+    x[[fld]][rows] <- v[rows] * sh_b
+  }
+  
+  fam <- rep(NA_integer_, nrow(x)); fam[rows] <- rows
+  x   <- rbind(x, f)
+  fam <- c(fam, par)
+  x$area_m2 <- area_m2(x)
+  log_msg("Pinch points (neck < ", p$neck_width_m, " m): ", length(rows), " void units cut into ",
+          length(rows) + nrow(f), " parts")
+  
+  # Merge fragments (temporarily flagged as still_small)
+  ss0 <- if ("still_small" %in% names(x)) x$still_small else NULL
+  x$.ss0 <- if (is.null(ss0)) NA else ss0
+  x$still_small <- c(rep(FALSE, nrow(x) - nrow(f)), rep(TRUE, nrow(f)))
+  x <- merge_still_small(x, merge_params, c("area_m2", fields), family = fam)
+  if (is.null(ss0)) x$still_small <- NULL else x$still_small <- x$.ss0
+  x$.ss0 <- NULL
+  if (anyDuplicated(x$block_id_coverAOI)) stop("Duplicate block_id_coverAOI after pinch cut")
+  x
+}
+
 # Step 2: merge still_small polygons into the neighbor with the longest edge
-merge_still_small <- function(x, p, fields) {
+# family (optional): polygons with the same non-NA family never merge into
+# each other (used for fragments cut from one void unit, Step 2a)
+merge_still_small <- function(x, p, fields, family = NULL) {
   x$n_merged <- if ("n_merged" %in% names(x)) coalesce(as.integer(x$n_merged), 1L) else 1L
   if (!"still_small" %in% names(x)) return(x)
   
@@ -519,6 +671,8 @@ merge_still_small <- function(x, p, fields) {
   # Shared edge length per neighboring group, at tolerance tol
   edge_neighbors <- function(i, js, tol) {
     js <- js[grp[js] != grp[i]]
+    if (!is.null(family) && !is.na(family[i]))
+      js <- js[is.na(family[grp[js]]) | family[grp[js]] != family[i]]
     if (length(js) == 0) return(NULL)
     len  <- vapply(js, function(j) edge_length(g[i], g[j], tol), numeric(1))
     keep <- len >= p$min_edge_m
@@ -708,8 +862,77 @@ block_arcs <- function(blocks, p) {
   out
 }
 
+# Cut arcs at sharp interior bends (see Step 3, Bends)
+split_at_bends <- function(arcs, p) {
+  look <- p$bend_look_m
+  arcs$arc_parent <- arcs$arc_id
+  ac <- st_coordinates(arcs)
+  x  <- ac[, 1]; y <- ac[, 2]; L1 <- ac[, "L1"]
+  n  <- nrow(ac)
+  sl <- c(0, sqrt(diff(x)^2 + diff(y)^2))
+  sl[!duplicated(L1)] <- 0
+  d_s <- ave(sl, L1, FUN = cumsum)
+  tot <- tapply(d_s, L1, max)
+  off <- c(0, cumsum(tot + 2 * look + 1))[seq_along(tot)]
+  g   <- d_s + off[L1]                              # non-decreasing position along all arcs
+  fi  <- which(!duplicated(L1))[L1]                 # first / last vertex of each vertex's arc
+  la  <- which(!duplicated(L1, fromLast = TRUE))[L1]
+  
+  # Vertices bend_look_m before and after each vertex (clamped to the arc)
+  b <- pmax(findInterval(g - look, g), fi)
+  f <- pmin(findInterval(g + look, g, left.open = TRUE) + 1L, la)
+  ux1 <- x - x[b]; uy1 <- y - y[b]
+  ux2 <- x[f] - x; uy2 <- y[f] - y
+  l1  <- sqrt(ux1^2 + uy1^2); l2 <- sqrt(ux2^2 + uy2^2)
+  turn <- acos(pmin(1, pmax(-1, (ux1 * ux2 + uy1 * uy2) / (l1 * l2)))) * 180 / pi
+  idx  <- seq_len(n)
+  cand <- l1 > 0 & l2 > 0 & turn > p$bend_max_deflect & idx != fi & idx != la
+  cand[is.na(cand)] <- FALSE
+  
+  # Local maxima of the turn, then greedy spacing >= look within an arc
+  sp <- c(FALSE, L1[-1] == L1[-n])                  # same arc as previous vertex
+  sn <- c(L1[-1] == L1[-n], FALSE)                  # same arc as next vertex
+  tp <- c(-Inf, turn[-n]); tn <- c(turn[-1], -Inf)
+  ci <- which(cand & (!sp | turn >= tp) & (!sn | turn > tn))
+  if (length(ci) == 0) {
+    log_msg("Bends cut: 0")
+    return(arcs)
+  }
+  ci  <- ci[order(L1[ci], -turn[ci])]
+  cut <- integer(0)
+  for (arc in split(ci, L1[ci])) {
+    kept <- numeric(0)
+    for (k in arc) if (all(abs(g[k] - kept) >= look)) { kept <- c(kept, g[k]); cut <- c(cut, k) }
+  }
+  cut <- sort(cut)
+  
+  # Rebuild the cut arcs as pieces; a cut vertex ends one piece and starts the next
+  is_cut <- logical(n); is_cut[cut] <- TRUE
+  hit <- unique(L1[cut])
+  sel <- which(L1 %in% hit)
+  pc  <- ave(as.integer(is_cut[sel]), L1[sel], FUN = cumsum)
+  rows <- c(sel, cut)
+  pcs  <- c(pc, pc[match(cut, sel)] - 1L)
+  o    <- order(L1[rows], pcs, rows)
+  rows <- rows[o]; pcs <- pcs[o]
+  key  <- paste(L1[rows], pcs)
+  grp  <- split(rows, factor(key, levels = unique(key)))
+  par  <- L1[vapply(grp, `[`, integer(1), 1)]
+  geo  <- st_sfc(lapply(grp, function(r) st_linestring(cbind(x[r], y[r]))), crs = st_crs(arcs))
+  pieces <- st_sf(arc_id = NA_integer_, block_i = arcs$block_i[par], block_j = arcs$block_j[par],
+                  arc_len_m = as.numeric(st_length(geo)), arc_parent = arcs$arc_id[par],
+                  geometry = geo)
+  out <- rbind(arcs[-hit, c("arc_id", "block_i", "block_j", "arc_len_m", "arc_parent")], pieces)
+  out <- out[order(out$arc_parent), ]
+  out$arc_id <- seq_len(nrow(out))
+  log_msg("Bends cut (> ", p$bend_max_deflect, " deg over ", look, " m): ", length(cut),
+          " in ", length(hit), " arcs; arcs ", nrow(arcs), " -> ", nrow(out))
+  out
+}
+
 # Strokes: chain arcs through junctions by smallest deflection
 build_strokes <- function(arcs, p) {
+  arcs <- split_at_bends(arcs, p)
   ac  <- st_coordinates(arcs)
   L1  <- ac[, "L1"]
   sl  <- c(0, sqrt(diff(ac[, 1])^2 + diff(ac[, 2])^2))
@@ -746,7 +969,8 @@ build_strokes <- function(arcs, p) {
   # Candidate continuations at each junction, best (straightest) first
   pr <- inner_join(ends, ends, by = "node", suffix = c("_a", "_b"),
                    relationship = "many-to-many") |>
-    filter(end_id_a < end_id_b, arc_a != arc_b) |>
+    filter(end_id_a < end_id_b, arc_a != arc_b,
+           arcs$arc_parent[arc_a] != arcs$arc_parent[arc_b]) |>   # pieces of a cut arc never rejoin
     mutate(deflect = acos(pmin(1, pmax(-1, -(dx_a * dx_b + dy_a * dy_b)))) * 180 / pi) |>
     filter(deflect <= p$stroke_max_deflect) |>
     arrange(deflect)
@@ -899,11 +1123,11 @@ assign_by_adjacency <- function(blocks, pairs, p) {
 # -----------------------------------------------------------------------------
 
 # Recursively split one tree (nodes, tree edges) into regions
-split_tree <- function(nodes, te, area, bldg, p) {
+split_tree <- function(nodes, te, area, pop, p) {
   tgt_a <- p$target_ha * 1e4
   max_a <- p$hard_max_ha * 1e4
   min_a <- p$min_piece_ha * 1e4
-  load  <- function(a, b) pmax(a / tgt_a, b / p$bldg_soft_max)
+  load  <- function(a, b) pmax(a / tgt_a, b / p$pop_soft_max)
   
   out   <- list()
   stack <- list(list(nodes = nodes, te = te))
@@ -913,20 +1137,21 @@ split_tree <- function(nodes, te, area, bldg, p) {
     v <- cur$nodes
     e <- cur$te
     A <- sum(area[v])
-    B <- sum(bldg[v])
-    if ((A <= tgt_a && B <= p$bldg_soft_max) || nrow(e) == 0) {
+    B <- sum(pop[v])
+    if ((A <= tgt_a && B <= p$pop_soft_max) || nrow(e) == 0) {
       out[[length(out) + 1]] <- v
       next
     }
     
     rt   <- root_tree(v, e)
-    sums <- subtree_sums(cbind(area[v], bldg[v]), rt$order, rt$parent)
+    sums <- subtree_sums(cbind(area[v], pop[v]), rt$order, rt$parent)
     
     # Candidate cuts: the tree edge above each non-root node
     child <- rt$order[-1]
     a_in  <- sums[child, 1]; b_in <- sums[child, 2]
     a_out <- A - a_in;       b_out <- B - b_in
-    ok <- if (A > max_a) rep(TRUE, length(child)) else (a_in >= min_a & a_out >= min_a)
+    big_enough <- function(a, b) a >= min_a | b >= p$min_piece_pop
+    ok <- if (A > max_a) rep(TRUE, length(child)) else (big_enough(a_in, b_in) & big_enough(a_out, b_out))
     if (!any(ok)) {
       out[[length(out) + 1]] <- v
       next
@@ -1006,7 +1231,7 @@ split_compact <- function(nodes, te, x, y, a, p) {
 # SECTION 7. Steps 5-6: segment labels and refinement
 # -----------------------------------------------------------------------------
 # Segments are handled as integer labels on blocks (L). Block data `blk`:
-# a = area (m2), b = building count, cx, cy = centroid (city-centered), z = zone.
+# a = area (m2), b = population (pop_lsm_ambient), cx, cy = centroid (city-centered), z = zone.
 
 # Step 5: initial new segments from unassigned blocks (seg_ids NA).
 #   1. unassigned blocks with a zone form connected clusters of one zone
@@ -1196,8 +1421,16 @@ refine_segments <- function(L, blk, pairs, state) {
   splittable <- function(ids) p$split_original | state$src[as.character(ids)] == "new"
   
   # Merge rules
+  # Longest shared edge, preferring neighbors where the merged segment stays
+  # within the split limits (<= target_ha and <= pop_soft_max), so merges do
+  # not create segments that the next pass splits again; otherwise any
+  # neighbor within hard_max_ha.
+  soft_ok <- function(c, t, s)
+    s$A[c] + s$A[t] <= p$target_ha * 1e4 && s$B[c] + s$B[t] <= p$pop_soft_max
   longest <- function(c, nb, len, s) {
-    for (t in nb[order(-len)]) if (s$A[c] + s$A[t] <= cap) return(t)
+    o <- nb[order(-len)]
+    for (t in o) if (soft_ok(c, t, s)) return(t)
+    for (t in o) if (s$A[c] + s$A[t] <= cap) return(t)
     NA
   }
   single <- function(c, nb, len, s) {
@@ -1217,7 +1450,8 @@ refine_segments <- function(L, blk, pairs, state) {
   # no-zone neighbor, then (3) any sparse neighbor, choosing the most
   # compact result. The result must stay <= sparse max_ha.
   sparse <- function(c, nb, len, s) {
-    fit  <- s$A[c] + s$A[nb] <= sparse_params$max_ha * 1e4
+    fit  <- s$A[c] + s$A[nb] <= sparse_params$max_ha * 1e4 &
+      s$B[c] + s$B[nb] <= p$pop_soft_max
     dens <- s$B[nb] / s$A[nb] * 1e4
     zc <- s$zone[c]
     zn <- s$zone[nb]
@@ -1242,7 +1476,7 @@ refine_segments <- function(L, blk, pairs, state) {
     # (a) Large segments
     st  <- seg_stats(L, blk)
     lim <- if (it == 1) p$target_ha else p$hard_max_ha
-    big <- st$id[(st$A > lim * 1e4 | (it == 1 & st$B > p$bldg_soft_max)) & splittable(st$id)]
+    big <- st$id[(st$A > lim * 1e4 | st$B > p$pop_soft_max) & splittable(st$id)]
     res <- split_labels(L, blk, pairs, big,
                         function(nodes, te, rows)
                           split_tree(nodes, te, blk$a[rows], blk$b[rows], p),
@@ -1269,7 +1503,8 @@ refine_segments <- function(L, blk, pairs, state) {
     
     # (d) Tiny segments
     L <- merge_labels(L, blk, pairs,
-                      function(i, s) !is.na(s$A[i]) && s$A[i] < p$min_seg_ha * 1e4,
+                      function(i, s) !is.na(s$A[i]) && s$A[i] < p$min_seg_ha * 1e4 &&
+                        s$B[i] < p$min_seg_pop,
                       longest_z, "Tiny segments")
     
     # (e) Donuts: segments with exactly one neighbor
@@ -1287,7 +1522,7 @@ refine_segments <- function(L, blk, pairs, state) {
     # (g) Stranded segments
     L <- merge_labels(L, blk, pairs,
                       function(i, s) !is.na(s$A[i]) &&
-                        s$B[i] < stranded_params$bldg_threshold &&
+                        s$B[i] < stranded_params$pop_threshold &&
                         s$A[i] < stranded_params$max_ha * 1e4,
                       longest_z, "Stranded segments")
     
@@ -1346,6 +1581,8 @@ dissolve_segments <- function(blocks, seg, pts, fields) {
   out$area_m2 <- area_m2(out)
   out$area_ha <- out$area_m2 / 1e4
   out$bldg_per_ha <- coalesce(as.numeric(out$bldg_cnt), 0) / out$area_ha
+  if (pop_field %in% names(out))
+    out$pop_per_ha <- coalesce(as.numeric(out[[pop_field]]), 0) / out$area_ha
   
   ref <- st_drop_geometry(seg)[intersect(c("seg_part_ID", "seg_fid", "seg_part_area_m2",
                                            "segment_area_m2"), names(seg))]
@@ -1355,13 +1592,67 @@ dissolve_segments <- function(blocks, seg, pts, fields) {
 }
 
 # -----------------------------------------------------------------------------
+# SECTION 8b. Step 2b: LandScan Mosaic population per block
+# -----------------------------------------------------------------------------
+
+# Path of the LandScan raster for a city (see `landscan` in SECTION 1)
+landscan_path <- function(city) {
+  f <- landscan$file[landscan$city == city]
+  if (length(f) != 1) stop("No LandScan entry for city: ", city)
+  if (!file.exists(f)) stop("LandScan file not found: ", f)
+  f
+}
+
+# Sum of LandScan population per block: each cell value times the share of
+# the cell covered by the block (exactextractr). Blocks are reprojected to
+# the raster CRS for the extraction only. Result cached by block ID.
+block_population <- function(blocks, city) {
+  ras_path <- landscan_path(city)
+  ids <- blocks$block_id_coverAOI
+  if (is.null(ids) || anyDuplicated(ids))
+    stop("block_id_coverAOI missing or not unique after Step 2; cannot cache population")
+  dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+  cache <- file.path(cache_dir, paste0(city, "_cln2_", pop_field, ".rds"))
+  
+  if (file.exists(cache)) {
+    cc <- readRDS(cache)
+    if (identical(cc$raster, ras_path) && identical(cc$id, ids) &&
+        isTRUE(all.equal(cc$area, blocks$area_m2, tolerance = 1e-6))) {
+      log_msg("Population: from cache ", basename(cache))
+      return(cc$pop)
+    }
+    log_msg("Population: cache out of date (blocks or raster changed); recomputing")
+  }
+  
+  log_msg("Population: extracting ", basename(ras_path), " for ", nrow(blocks), " blocks")
+  r  <- rast(ras_path)
+  if (nlyr(r) > 1) {
+    log_msg("WARNING: raster has ", nlyr(r), " layers (", paste(names(r), collapse = ", "),
+            "); using the first")
+    r <- r[[1]]
+  }
+  g  <- st_transform(st_geometry(blocks), st_crs(crs(r)))
+  bb <- st_bbox(g)
+  r  <- crop(r, ext(bb[["xmin"]], bb[["xmax"]], bb[["ymin"]], bb[["ymax"]]), snap = "out")
+  pop <- exact_extract(r, st_sf(geometry = g), "sum", progress = FALSE)
+  pop[is.na(pop)] <- 0
+  if (any(pop < 0))
+    stop("Negative population sums: check the raster's NoData value (", ras_path, ")")
+  
+  log_msg("Population: total ", format(round(sum(pop)), big.mark = ","),
+          "; blocks with 0 people: ", sum(pop == 0), " of ", length(pop))
+  saveRDS(list(raster = ras_path, id = ids, area = blocks$area_m2, pop = pop), cache)
+  pop
+}
+
+# -----------------------------------------------------------------------------
 # SECTION 9. Per-city workflow
 # -----------------------------------------------------------------------------
 process_city <- function(city, segments_file, blocks_file) {
   log_msg("=== ", city, " ===")
   
-  paths <- c(segments = file.path(root, segments_file),
-             blocks   = file.path(root, blocks_file))
+  paths <- c(segments = file.path(seg_dir, segments_file),
+             blocks   = file.path(blk_dir, blocks_file))
   missing <- paths[!file.exists(paths)]
   if (length(missing))
     stop("Input not found: ", paste(names(missing), missing, sep = " = ", collapse = "; "))
@@ -1385,9 +1676,16 @@ process_city <- function(city, segments_file, blocks_file) {
   blocks <- drop_artifacts(blocks, merge_params)
   blocks <- merge_still_small(blocks, merge_params, sum_fields)
   blocks$area_m2 <- area_m2(blocks)
+  
+  # Step 2a: cut void units at pinch points; merge fragments (block geometry is final after this)
+  blocks <- cut_void_pinches(blocks, pinch_params, sum_fields)
+  blocks$area_m2 <- area_m2(blocks)
   cent <- centroid_fun(st_geometry(blocks))
   cxy  <- st_coordinates(cent)
   pts  <- st_point_on_surface(st_geometry(blocks))
+  
+  # Step 2b: LandScan Mosaic population per block (cached)
+  blocks[[pop_field]] <- block_population(blocks, city)
   
   # Step 3: shared edges, strokes, block adjacency (block row indices)
   arcs  <- block_arcs(blocks, seg_params)
@@ -1420,7 +1718,7 @@ process_city <- function(city, segments_file, blocks_file) {
   
   # Step 6: refinement
   blk <- list(a = blocks$area_m2,
-              b = coalesce(as.numeric(blocks$bldg_cnt), 0),
+              b = coalesce(as.numeric(blocks[[pop_field]]), 0),
               cx = cxy[, 1] - mean(cxy[, 1]),
               cy = cxy[, 2] - mean(cxy[, 2]),
               z = zone)
@@ -1431,7 +1729,7 @@ process_city <- function(city, segments_file, blocks_file) {
   blocks$seg_source  <- unname(state$src[as.character(L)])
   
   # Step 7: dissolve and attributes
-  segments <- dissolve_segments(blocks, seg, pts, sum_fields)
+  segments <- dissolve_segments(blocks, seg, pts, c(sum_fields, pop_field))
   st <- seg_stats(L, blk)
   m  <- match(segments$seg_part_ID, st$id)
   segments$zone_id       <- st$zone[m]
@@ -1457,8 +1755,12 @@ process_city <- function(city, segments_file, blocks_file) {
           sum(a < seg_params$min_seg_ha))
   log_msg("Segments with holes: ", sum(segments$n_holes > 0), "; compact_j > ",
           compact_params$j_max, ": ", sum(segments$compact_j > compact_params$j_max),
-          "; < ", stranded_params$bldg_threshold, " buildings: ",
-          sum(coalesce(as.numeric(segments$bldg_cnt), 0) < stranded_params$bldg_threshold))
+          "; < ", stranded_params$pop_threshold, " people: ",
+          sum(coalesce(as.numeric(segments[[pop_field]]), 0) < stranded_params$pop_threshold))
+  pp <- segments[[pop_field]]
+  log_msg("Population per segment: median ", round(median(pp)), "; > ",
+          seg_params$pop_soft_max, ": ", sum(pp > seg_params$pop_soft_max),
+          "; max ", round(max(pp)))
   
   # Step 8: write
   out <- paths[["blocks"]]

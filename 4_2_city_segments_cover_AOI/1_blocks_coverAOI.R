@@ -28,8 +28,8 @@
 #   Set `run_cities` in SECTION 1 to one or more of the cities in `cities`,
 #   then source the script. Cities are processed one at a time. Results are
 #   checkpointed in <out_dir>/checkpoints/ after Step 3
-#   (<city>_void_checkpoint.rds) and Step 5
-#   (<city>_coverage_checkpoint.rds); with resume = TRUE a rerun loads the
+#   (<city>_cln1_void_checkpoint.rds) and Step 5
+#   (<city>_cln1_coverage_checkpoint.rds); with resume = TRUE a rerun loads the
 #   latest checkpoint and continues from the following step.
 #
 # INPUTS (per city; see `cities` in SECTION 1)
@@ -40,7 +40,7 @@
 #   epsg           Projected CRS (UTM, metres) used for all geometry ops
 #
 # OUTPUT
-#   <out_dir>/<city>_blocks_segments_metrics_coverAOI.gpkg, layer "blocks"
+#   <out_dir>/<city>_blocks_segments_metrics_coverAOI.gpkg, layer "blocks_cln1"
 #     block_id_coverAOI  unique polygon ID within the city coverage
 #     source             "grid3_block" or "aoi_void"
 #     block_fid          fid of the source GRID3 block (NA for void units)
@@ -57,7 +57,7 @@
 #                        not be split)
 #     <existing GRID3 block attributes>  (NA for void units)
 #   Optional QA layers (write_qa_layers = TRUE):
-#   <out_dir>/<city>_coverAOI_qa.gpkg
+#   <out_dir>/<city>_coverAOI_qa_cln1.gpkg
 #     aoi_void, void_skeleton, void_pieces, hex_grid, void_hex
 #
 # METHOD
@@ -159,14 +159,15 @@ sf_use_s2(FALSE)
 # -----------------------------------------------------------------------------
 
 # Cities to process: any subset of cities$city
-run_cities <- c("johannesburg", "juba", "kigali")
+run_cities <- c("kigali", "johannesburg") #c("johannesburg", "juba", "kigali")
 
-root_blocks   <- "//DATASERVER1/ScienceData$/dthomson/Documents/zzz_WORK/p_WB_LandAtlas/deliverables/Data - Revising block segment attributes"
+out_dir       <- "//DATASERVER1/ScienceData$/dthomson/Documents/zzz_WORK/p_WB_LandAtlas/deliverables/Data - Revising block segment attributes"
+root_blocks   <- file.path(out_dir, "alex blocks segments")   # GRID3 blocks input (from Alex)
 root_overture <- "//DATASERVER1/ScienceData$/dthomson/Documents/zzz_WORK/Data/WorldBank/Overture"
 root_aoi      <- "//DATASERVER1/ScienceData$/dthomson/Documents/zzz_WORK/p_WB_LandAtlas/experiment_urban_extents"
-out_dir       <- root_blocks
 
 write_qa_layers <- FALSE
+out_layer       <- "blocks_cln1"   # output layer in <city>_blocks_segments_metrics_coverAOI.gpkg
 
 # Checkpointing: results after Step 3 and Step 5 are saved per city. With
 # resume = TRUE, the latest checkpoint is loaded and earlier steps are
@@ -801,8 +802,8 @@ process_city <- function(city, blocks_file, overture_file, aoi_file, epsg) {
   if (length(missing))
     stop("Input not found: ", paste(names(missing), missing, sep = " = ", collapse = "; "))
   
-  ckpt   <- file.path(checkpoint_dir, paste0(city, "_coverage_checkpoint.rds"))
-  ckpt_v <- file.path(checkpoint_dir, paste0(city, "_void_checkpoint.rds"))
+  ckpt   <- file.path(checkpoint_dir, paste0(city, "_cln1_coverage_checkpoint.rds"))
+  ckpt_v <- file.path(checkpoint_dir, paste0(city, "_cln1_void_checkpoint.rds"))
   
   if (resume && file.exists(ckpt)) {
     # Resume after Step 5 from checkpoint
@@ -884,11 +885,11 @@ process_city <- function(city, blocks_file, overture_file, aoi_file, epsg) {
   
   # Write
   out <- file.path(out_dir, paste0(city, "_blocks_segments_metrics_coverAOI.gpkg"))
-  st_write(cover, out, layer = "blocks", delete_layer = TRUE, quiet = TRUE)
-  log_msg("Written: ", out)
+  st_write(cover, out, layer = out_layer, delete_layer = TRUE, quiet = TRUE)
+  log_msg("Written: ", out, " [", out_layer, "]")
   
   if (write_qa_layers) {
-    qa <- file.path(out_dir, paste0(city, "_coverAOI_qa.gpkg"))
+    qa <- file.path(out_dir, paste0(city, "_coverAOI_qa_cln1.gpkg"))
     st_write(vd$void,   qa, layer = "aoi_void",    delete_layer = TRUE, quiet = TRUE)
     st_write(vd$pieces, qa, layer = "void_pieces", delete_layer = TRUE, quiet = TRUE)
     if (!is.null(vd$skeleton))
